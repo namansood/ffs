@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"fmt"
 	"log"
 )
 
@@ -23,12 +24,17 @@ type Node interface {
 	IsDir() bool
 	getRef() uint64
 	setRef(uint64)
+	fmt.Stringer
 }
 
 type File struct {
 	name []byte
 	data []byte
 	ref  uint64
+}
+
+func (f *File) String() string {
+	return fmt.Sprintf("%s: % x", string(f.name), f.data)
 }
 
 func (f *File) Name() []byte {
@@ -55,14 +61,15 @@ func (f *File) setRef(v uint64) {
 	f.ref = v
 }
 
-func Metadata(n Node) []byte {
+func MetadataBlobFromNode(n Node) []byte {
 	buf := make([]byte, FILE_METADATA_SIZE)
 	idx := 0
 	filename := n.Name()
-	binary.BigEndian.PutUint16(buf[idx:idx+MAX_NAMESIZE_SIZE], uint16(len(filename)))
+	filenameLen := uint16(len(filename))
+	binary.BigEndian.PutUint16(buf[idx:idx+MAX_NAMESIZE_SIZE], filenameLen)
 	idx += MAX_NAMESIZE_SIZE
-	copy(buf[idx:idx+MAX_NAME_SIZE], filename)
-	idx += MAX_NAME_SIZE
+	copy(buf[idx:idx+int(filenameLen)], filename)
+	idx += int(filenameLen)
 	binary.BigEndian.PutUint64(buf[idx:idx+MAX_FILE_SIZE], n.Size())
 	idx += MAX_FILE_SIZE
 	binary.BigEndian.PutUint64(buf[idx:idx+REF_SIZE], n.getRef())
@@ -83,6 +90,15 @@ type Directory struct {
 	ref    uint64
 
 	precomputedData []byte
+}
+
+func (d *Directory) String() string {
+	out := string(d.name) + ": { "
+	for _, n := range d.nodes {
+		out += n.String() + ", "
+	}
+	out += "}"
+	return out
 }
 
 func (d *Directory) Name() []byte {
@@ -109,11 +125,11 @@ func (d *Directory) Data() []byte {
 
 	metadataSize := len(d.nodes) * FILE_METADATA_SIZE
 
-	fileRef := d.getRef() + REF_SIZE + uint64(metadataSize)
+	fileRef := d.getRef() + REF_SIZE + MAX_FILECOUNT_SIZE + uint64(metadataSize)
 
 	for _, n := range d.nodes {
 		n.setRef(fileRef)
-		buf = append(buf, Metadata(n)...)
+		buf = append(buf, MetadataBlobFromNode(n)...)
 		fileRef += n.Size()
 	}
 
@@ -137,10 +153,72 @@ func (d *Directory) setRef(v uint64) {
 	d.ref = v
 }
 
+func ParseNodeFromBlob(metadata []byte, rootBuf []byte, parent *Directory) (Node, error) {
+	idx := 0
+	filenameLen := int(binary.BigEndian.Uint16(metadata[idx : idx+MAX_NAMESIZE_SIZE]))
+	idx += MAX_NAMESIZE_SIZE
+	filename := metadata[idx : idx+filenameLen]
+	idx += filenameLen
+	filesize := binary.BigEndian.Uint64(metadata[idx : idx+MAX_FILE_SIZE])
+	idx += MAX_FILE_SIZE
+	ref := binary.BigEndian.Uint64(metadata[idx : idx+REF_SIZE])
+	idx += REF_SIZE
+	// isDir == false
+	if metadata[idx] == 0 {
+		return &File{
+			name: filename,
+			data: rootBuf[ref : ref+filesize],
+			ref:  ref,
+		}, nil
+	}
+
+	return ParseDirectory(rootBuf[ref:ref+filesize], rootBuf, parent, filename, ref)
+}
+
+func ParseRoot(data []byte) (*Directory, error) {
+	return ParseDirectory(data, data, nil, []byte("ffsroot"), 0)
+}
+
+func ParseDirectory(data []byte, rootBuf []byte, parent *Directory, name []byte, ref uint64) (*Directory, error) {
+	dir := &Directory{
+		parent: parent,
+		name:   name,
+		ref:    ref,
+	}
+
+	idx := 0
+	parentRef := binary.BigEndian.Uint64(data[idx : idx+REF_SIZE])
+	idx += REF_SIZE
+
+	if parent != nil && parent.getRef() != parentRef {
+		return nil, fmt.Errorf("parent ref %v does not match parent %s", parentRef, parent.name)
+	}
+
+	fileCount := binary.BigEndian.Uint64(data[idx : idx+MAX_FILECOUNT_SIZE])
+	idx += MAX_FILECOUNT_SIZE
+
+	nodes := make([]Node, fileCount)
+
+	var i uint64
+	for i = 0; i < fileCount; i++ {
+		mdBytes := data[idx : idx+FILE_METADATA_SIZE]
+		idx += FILE_METADATA_SIZE
+		node, err := ParseNodeFromBlob(mdBytes, rootBuf, dir)
+		if err != nil {
+			return nil, fmt.Errorf("could not read file from directory %s, err %v", string(name), err)
+		}
+		nodes[i] = node
+	}
+
+	dir.nodes = nodes
+
+	return dir, nil
+}
+
 func main() {
 	root := &Directory{
 		parent: nil,
-		name:   []byte("root"),
+		name:   []byte("ffsroot"),
 		nodes:  nil,
 		ref:    0,
 	}
@@ -164,9 +242,18 @@ func main() {
 
 	root.nodes = []Node{foo, bar}
 
+	log.Printf("oldRoot: %s", root)
+
 	data := root.Data()
 	sz := root.Size()
 
 	log.Printf("Data: % x", data)
 	log.Printf("Size: %v", sz)
+
+	newRoot, err := ParseRoot(data)
+	if err != nil {
+		panic(err)
+	}
+
+	log.Printf("newRoot: %s", newRoot)
 }
